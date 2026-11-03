@@ -46,6 +46,58 @@ class SymbolMatch(unittest.TestCase):
     def test_slash_code_has_a_dot_candidate(self):
         self.assertEqual(TV.search_codes("BRK/B"), ["BRK/B", "BRK.B"])
         self.assertEqual(TV.ticker_code("BRK/B.US"), ("BRK/B", "US"))
+        self.assertEqual(TV.search_codes("RR/"), ["RR/", "RR.", "RR"])
+
+
+class Listings(unittest.TestCase):
+    def test_inferred_exchange_from_ticker_suffix(self):
+        self.assertEqual(TV.inferred_exchanges("2628.HK"), ["HKG"])
+        self.assertEqual(TV.inferred_exchanges("600031.CH"), ["SHH"])
+        self.assertEqual(TV.inferred_exchanges("002138.CH"), ["SHZ"])
+        self.assertEqual(TV.inferred_exchanges("RR/.LN"), ["LSE"])
+        self.assertEqual(TV.inferred_exchanges("MOD.US")[0], "NMS")
+        self.assertIn("NYQ", TV.inferred_exchanges("MOD.US"))
+
+    def test_exchange_candidates_keep_profile_first(self):
+        self.assertEqual(TV.exchange_candidates("MOD.US", "NYQ")[0], "NYQ")
+        self.assertEqual(TV.exchange_candidates("2628.HK", ""), ["HKG"])
+
+    def test_listings_reads_munger_universe(self):
+        env = {
+            "MUNGER_CH_HOST": "h",
+            "MUNGER_CH_HTTP_PORT": "8123",
+            "MUNGER_CH_DATABASE": "munger",
+            "MUNGER_CH_USER": "u",
+            "MUNGER_CH_PASSWORD": "p",
+        }
+
+        def fake_munger(_env, sql):
+            if "FROM universe" in sql:
+                return [{"ticker": "2628.HK"}, {"ticker": "002138.CH"}]
+            if "FROM stock_profile" in sql:
+                return [{"ticker": "2628.HK", "exchange": "HKG", "currency": "HKD"}]
+            return []
+
+        def fake_pangu(_env, sql):
+            return [{"ticker": "AAPL.US", "exchange": "NMS", "currency": "USD"}]
+
+        old_munger = TV.ch_query_munger
+        old_pangu = TV.ch_query
+        TV.ch_query_munger = fake_munger
+        TV.ch_query = fake_pangu
+        try:
+            items = TV.listings(env)
+        finally:
+            TV.ch_query_munger = old_munger
+            TV.ch_query = old_pangu
+        self.assertEqual([item["ticker"] for item in items], ["2628.HK", "002138.CH"])
+        by_ticker = {item["ticker"]: item for item in items}
+        self.assertEqual(by_ticker["2628.HK"]["exchange"], "HKG")
+        self.assertEqual(by_ticker["002138.CH"]["exchange"], "SHZ")
+
+    def test_listings_need_munger_account(self):
+        with self.assertRaises(TV.StopRun):
+            TV.listings({})
 
 
 class QuoteCompletion(unittest.TestCase):
@@ -87,6 +139,42 @@ class Changes(unittest.TestCase):
         self.assertEqual(header, "sessionid=abc")
         self.assertTrue(TV.cookies_usable([{"name": "sessionid", "value": "abc", "domain": ".tradingview.com", "expires": -1}]))
         self.assertFalse(TV.cookies_usable([{"name": "other", "value": "abc", "domain": ".tradingview.com"}]))
+
+    def test_keep_alive_does_not_fall_back_to_password(self):
+        import inspect
+
+        source = inspect.getsource(TV.login)
+        self.assertIn("allow_password", source)
+        self.assertIn("browser_refresh_token", source)
+        self.assertIn("reuse_saved", source)
+
+    def _jwt(self, exp_offset: float) -> str:
+        import base64
+        import json
+        import time
+
+        header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
+        payload = base64.urlsafe_b64encode(json.dumps({"exp": time.time() + exp_offset}).encode()).decode().rstrip("=")
+        return "%s.%s.sig" % (header, payload)
+
+    def test_extracts_live_token_from_homepage_html(self):
+        token = self._jwt(3600)
+        html = '<html class="is-authenticated is-pro"><script>window.user={"auth_token":"%s"}</script>' % token
+        self.assertEqual(TV.extract_auth_token(html), token)
+
+    def test_skips_expired_token_in_homepage_html(self):
+        html = '{"auth_token":"%s"}' % self._jwt(-60)
+        self.assertEqual(TV.extract_auth_token(html), "")
+
+    def test_refresh_reads_homepage_not_retired_account_api(self):
+        import inspect
+
+        source = inspect.getsource(TV.refresh_token)
+        self.assertIn("HOME_URL", source)
+        self.assertNotIn("accounts/current", source)
+        keep_alive = (Path(__file__).resolve().parents[1] / "scripts" / "tv_keep_alive.py").read_text(encoding="utf-8")
+        self.assertIn("reuse_saved=False", keep_alive)
+        self.assertIn("allow_password=False", keep_alive)
 
 
 if __name__ == "__main__":

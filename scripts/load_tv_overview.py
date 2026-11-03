@@ -415,7 +415,7 @@ def run(mode: str, only: set[str], limit: int, force: bool) -> None:
             try:
                 if not tv_symbol:
                     code, _suffix = FIN.ticker_code(ticker)
-                    tv_symbol, reason = Q.resolve_symbol(code, item.get("exchange") or "")
+                    tv_symbol, reason = Q.resolve_symbol(code, item.get("exchange") or "", ticker)
                     time.sleep(random.uniform(0.8, 1.6))
                     if not tv_symbol:
                         unresolved += 1

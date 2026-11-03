@@ -6,6 +6,9 @@ PY="${TV_PYTHON:-/usr/bin/python3}"
 mkdir -p data
 LOG=data/tv_full.log
 {
+  echo "=== $(date -Is) screener ==="
+  "$PY" -u scripts/load_tv_screener.py
+  echo "screener exit $?"
   echo "=== $(date -Is) quotes full ==="
   "$PY" -u scripts/load_tv_quotes.py --full --force
   echo "quotes exit $?"

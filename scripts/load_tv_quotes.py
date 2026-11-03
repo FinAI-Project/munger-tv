@@ -366,25 +366,13 @@ def sync_state(env: dict[str, str]) -> dict[str, dict]:
     return {row["ticker"]: row for row in rows}
 
 
-def resolve_symbol(code: str, exchange: str) -> tuple[str | None, str]:
-    source_id = FIN.EXCHANGE_MAP.get(exchange or "")
-    if not source_id:
-        return None, "没有对应的交易所"
-    last = "搜索结果里没有 %s:%s" % (source_id, code)
-    for index, candidate in enumerate(FIN.search_codes(code)):
-        if index:
-            time.sleep(random.uniform(0.8, 1.6))
-        try:
-            rows = FIN.search_symbol(candidate)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 403):
-                raise StopRun("代码搜索被限流") from exc
-            last = "搜索失败 %s" % exc.code
-            continue
-        found = FIN.match_symbol(rows, candidate, source_id)
-        if found:
-            return found, ""
-    return None, last
+def resolve_symbol(code: str, exchange: str, ticker: str = "") -> tuple[str | None, str]:
+    return FIN.resolve_symbol(
+        code,
+        exchange,
+        lambda: time.sleep(random.uniform(0.8, 1.6)),
+        ticker,
+    )
 
 
 def run(mode: str, only: set[str], limit: int, force: bool) -> None:
@@ -429,7 +417,7 @@ def run(mode: str, only: set[str], limit: int, force: bool) -> None:
             try:
                 if not tv_symbol:
                     code, _suffix = FIN.ticker_code(ticker)
-                    tv_symbol, reason = resolve_symbol(code, item.get("exchange") or "")
+                    tv_symbol, reason = resolve_symbol(code, item.get("exchange") or "", ticker)
                     time.sleep(random.uniform(0.8, 1.6))
                     if not tv_symbol:
                         unresolved += 1
@@ -440,7 +428,7 @@ def run(mode: str, only: set[str], limit: int, force: bool) -> None:
                         continue
                 bars = charts.fetch_bars(tv_symbol, count)
                 snap = quotes.fetch(tv_symbol, list(SNAPSHOT_FIELDS), require_statement=False)
-            except StopRun:
+            except (StopRun, FIN.StopRun):
                 raise
             except (OSError, EOFError, socket.timeout, RuntimeError) as exc:
                 failures += 1

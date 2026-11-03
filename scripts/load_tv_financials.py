@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把 TradingView 的财务数据写入 pangu，覆盖 universe 里的全部股票。
+"""把 TradingView 的财务数据写入 pangu，覆盖 munger.universe 里未删除的全部股票。
 
 每行仍是一个科目加一个期间。工业、银行、保险的科目名不一样，对不上的科目留空，不占行。
 
@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import socket
 import ssl
 import struct
@@ -37,10 +38,40 @@ ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 TOKEN_PATH = ROOT / "data" / "tv_auth_token"
 SESSION_PATH = ROOT / "data" / "tv_session.json"
+AUTH_STATUS_PATH = ROOT / "data" / "tv_auth_status.txt"
 LOCK_PATH = ROOT / "data" / "tv_financials.lock"
 
 HOST = "data.tradingview.com"
 SEARCH_URL = "https://symbol-search.tradingview.com/symbol_search/v3/"
+HOME_URL = "https://www.tradingview.com/"
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+)
+AUTH_TOKEN_RE = re.compile(r'"auth_token"\s*:\s*"([^"]+)"')
+MUNGER_KEYS = (
+    "MUNGER_CH_HOST",
+    "MUNGER_CH_HTTP_PORT",
+    "MUNGER_CH_DATABASE",
+    "MUNGER_CH_USER",
+    "MUNGER_CH_PASSWORD",
+)
+SUFFIX_EXCHANGES = {
+    "HK": ("HKG",),
+    "JP": ("JPX",),
+    "TT": ("TAI",),
+    "KS": ("KSC",),
+    "CN": ("TOR",),
+    "AU": ("ASX",),
+    "LN": ("LSE",),
+    "GR": ("GER",),
+    "IM": ("MIL",),
+    "SW": ("EBS",),
+    "FP": ("PAR",),
+    "NA": ("AMS",),
+    "BZ": ("SAO",),
+    "US": ("NMS", "NYQ", "NGM", "NCM"),
+}
 
 # 雅虎档案里的交易所代码 -> TradingView 的 source_id。只接受搜索结果里对上的那一只。
 EXCHANGE_MAP = {
@@ -207,6 +238,30 @@ def ch_query(env: dict[str, str], sql: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
+def munger_ready(env: dict[str, str]) -> bool:
+    return all(str(env.get(key) or "").strip() for key in MUNGER_KEYS)
+
+
+def ch_exec_munger(env: dict[str, str], sql: str, data: bytes | None = None) -> str:
+    params = urllib.parse.urlencode({"database": env["MUNGER_CH_DATABASE"], "query": sql})
+    url = "http://%s:%s/?%s" % (env["MUNGER_CH_HOST"], env.get("MUNGER_CH_HTTP_PORT", "8123"), params)
+    token = base64.b64encode(("%s:%s" % (env["MUNGER_CH_USER"], env["MUNGER_CH_PASSWORD"])).encode()).decode()
+    body = data if data is not None else b""
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Authorization", "Basic " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(detail) from exc
+
+
+def ch_query_munger(env: dict[str, str], sql: str) -> list[dict]:
+    text = ch_exec_munger(env, sql + "\nFORMAT JSONEachRow")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
 def sql_str(value: str) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
@@ -220,6 +275,41 @@ def ticker_code(ticker: str) -> tuple[str, str]:
     if not sep:
         return ticker, ""
     return code, suffix
+
+
+def inferred_exchanges(ticker: str) -> list[str]:
+    code, suffix = ticker_code(ticker)
+    if suffix == "CH":
+        if code.startswith(("6", "9")):
+            return ["SHH"]
+        return ["SHZ"]
+    return list(SUFFIX_EXCHANGES.get(suffix, ()))
+
+
+def exchange_candidates(ticker: str, profile_exchange: str = "") -> list[str]:
+    out = []
+    if profile_exchange:
+        out.append(profile_exchange)
+    for item in inferred_exchanges(ticker):
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def profile_map(query_fn) -> dict[str, dict]:
+    try:
+        rows = query_fn(
+            """
+            SELECT ticker,
+                   argMax(exchange, as_of_date) AS exchange,
+                   argMax(currency, as_of_date) AS currency
+            FROM stock_profile
+            GROUP BY ticker
+            """
+        )
+    except RuntimeError:
+        return {}
+    return {str(row.get("ticker") or ""): row for row in rows if row.get("ticker")}
 
 
 def ensure_tables(env: dict[str, str]) -> None:
@@ -347,22 +437,32 @@ def apply_comments(env: dict[str, str]) -> None:
 
 
 def listings(env: dict[str, str]) -> list[dict]:
-    return ch_query(
+    if not munger_ready(env):
+        raise StopRun("缺少 munger 库账号，读不到股票名单")
+    rows = ch_query_munger(
         env,
         """
-        SELECT u.ticker AS ticker, ifNull(p.exchange, '') AS exchange, ifNull(p.currency, '') AS currency
-        FROM universe AS u FINAL
-        LEFT JOIN
-        (
-            SELECT ticker,
-                   argMax(exchange, as_of_date) AS exchange,
-                   argMax(currency, as_of_date) AS currency
-            FROM stock_profile
-            GROUP BY ticker
-        ) AS p ON u.ticker = p.ticker
-        ORDER BY u.rank
+        SELECT ticker
+        FROM universe FINAL
+        WHERE deleted = 0
+        ORDER BY rank, ticker
         """,
     )
+    munger_profiles = profile_map(lambda sql: ch_query_munger(env, sql))
+    pangu_profiles = profile_map(lambda sql: ch_query(env, sql))
+    items = []
+    for row in rows:
+        ticker = str(row.get("ticker") or "").strip()
+        if not ticker:
+            continue
+        prof = munger_profiles.get(ticker) or pangu_profiles.get(ticker) or {}
+        exchange = str(prof.get("exchange") or "")
+        currency = str(prof.get("currency") or "")
+        if not exchange:
+            guessed = inferred_exchanges(ticker)
+            exchange = guessed[0] if guessed else ""
+        items.append({"ticker": ticker, "exchange": exchange, "currency": currency})
+    return items
 
 
 def sync_state(env: dict[str, str]) -> dict[str, dict]:
@@ -424,6 +524,9 @@ def search_codes(code: str) -> list[str]:
     codes = [code]
     if "/" in code:
         codes.append(code.replace("/", "."))
+    stripped = code.rstrip("/")
+    if stripped and stripped not in codes:
+        codes.append(stripped)
     return codes
 
 
@@ -775,31 +878,128 @@ def token_from_payload(raw) -> str:
     return ""
 
 
+def _note_refresh(text: str) -> None:
+    AUTH_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_STATUS_PATH.write_text("%s %s\n" % (stamp(), text), encoding="utf-8")
+
+
+def extract_auth_token(text: str) -> str:
+    """从首页 HTML 或 JSON 文本里取出还能用的短会话。"""
+    if not text:
+        return ""
+    for match in AUTH_TOKEN_RE.finditer(text):
+        token = match.group(1)
+        if token_still_good(token):
+            return token
+    return ""
+
+
 def refresh_token() -> str:
     session = load_session()
     cookies = session.get("cookies") or []
     if not cookies_usable(cookies):
+        _note_refresh("没有还能用的 sessionid")
         return ""
     header = cookie_header(cookies)
     if not header:
+        _note_refresh("Cookie 拼不出请求头")
         return ""
-    req = urllib.request.Request("https://www.tradingview.com/accounts/current/")
-    req.add_header("User-Agent", "Mozilla/5.0")
+    req = urllib.request.Request(HOME_URL)
+    req.add_header("User-Agent", BROWSER_UA)
     req.add_header("Cookie", header)
-    req.add_header("Referer", "https://www.tradingview.com/")
+    req.add_header("Referer", HOME_URL)
+    req.add_header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             body = response.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as exc:
+        _note_refresh("首页换会话返回 %s" % exc.code)
         return ""
-    try:
-        raw = json.loads(body)
-    except json.JSONDecodeError:
+    except urllib.error.URLError as exc:
+        _note_refresh("首页换会话连不上：%s" % exc.reason)
         return ""
-    token = token_from_payload(raw)
+    if "is-not-authenticated" in body:
+        _note_refresh("首页显示未登录，浏览器登录状态已经失效")
+        return ""
+    token = extract_auth_token(body)
     if token:
         save_session(token, session)
-    return token
+        _note_refresh("首页换到了新的短会话")
+        return token
+    _note_refresh("首页已打开，但没有还能用的短会话")
+    return ""
+
+
+def browser_refresh_token() -> str:
+    """用已保存的浏览器登录状态在无界面 Chromium 里换短会话。验证码点不了，续不上就返回空。"""
+    session = load_session()
+    cookies = session.get("cookies") or []
+    if not cookies_usable(cookies):
+        return ""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _note_refresh("这台机器没有 Playwright，没法用浏览器续会话")
+        return ""
+    state = {"cookies": cookies, "origins": session.get("origins") or []}
+    token = ""
+    html = ""
+    new_state = state
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(storage_state=state)
+            page = context.new_page()
+            page.goto(HOME_URL, wait_until="domcontentloaded", timeout=45000)
+            html = page.content()
+            token = extract_auth_token(html)
+            if not token:
+                try:
+                    found = page.evaluate(
+                        """() => {
+                            const user = window.user || {};
+                            return user.auth_token || user.authToken || '';
+                        }"""
+                    )
+                except Exception as exc:
+                    _note_refresh("浏览器里取会话失败：%s" % exc)
+                    found = ""
+                if isinstance(found, str) and token_still_good(found):
+                    token = found
+            new_state = context.storage_state()
+            browser.close()
+    except Exception as exc:
+        _note_refresh("无界面浏览器没起来：%s" % exc)
+        return ""
+    if token_still_good(token):
+        save_session(token, new_state)
+        _note_refresh("浏览器换到了新的短会话")
+        return token
+    if "is-not-authenticated" in html:
+        _note_refresh("浏览器首页显示未登录")
+    elif html:
+        _note_refresh("浏览器首页没有还能用的短会话")
+    return ""
+
+
+def login(env: dict[str, str], *, allow_password: bool = True, reuse_saved: bool = True) -> str:
+    if reuse_saved:
+        saved = read_saved_token()
+        if saved:
+            return saved
+    refreshed = refresh_token()
+    if refreshed:
+        print("已用浏览器登录状态换到新的短会话", flush=True)
+        return refreshed
+    browsed = browser_refresh_token()
+    if browsed:
+        print("已用无界面浏览器换到新的短会话", flush=True)
+        return browsed
+    if cookies_usable((load_session().get("cookies") or [])):
+        raise StopRun("浏览器登录状态还在，但换不到新会话。本机跑 scripts/tv_login.sh")
+    if not allow_password:
+        raise StopRun("没有还能用的短会话。本机跑 scripts/tv_login.sh")
+    return password_login(env)
 
 
 def password_login(env: dict[str, str]) -> str:
@@ -836,19 +1036,6 @@ def password_login(env: dict[str, str]) -> str:
     return token
 
 
-def login(env: dict[str, str]) -> str:
-    saved = read_saved_token()
-    if saved:
-        return saved
-    refreshed = refresh_token()
-    if refreshed:
-        print("短会话过期了，已用浏览器登录状态换到新的", flush=True)
-        return refreshed
-    if cookies_usable((load_session().get("cookies") or [])):
-        raise StopRun("浏览器登录状态还在，但换不到新会话。本机跑 scripts/tv_login.sh")
-    return password_login(env)
-
-
 def search_symbol(text: str) -> list[dict]:
     query = urllib.parse.urlencode(
         {
@@ -870,27 +1057,38 @@ def search_symbol(text: str) -> list[dict]:
     return rows if isinstance(rows, list) else []
 
 
-def resolve_symbol(code: str, exchange: str, pause) -> tuple[str | None, str]:
-    source_id = EXCHANGE_MAP.get(exchange or "")
-    if not source_id:
-        return None, "没有对应的交易所"
-    last_error = "搜索结果里没有 %s:%s" % (source_id, code)
-    for index, candidate in enumerate(search_codes(code)):
-        if index:
-            pause()
-        try:
-            rows = search_symbol(candidate)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 403):
-                raise StopRun("代码搜索被限流") from exc
-            last_error = "搜索失败 %s" % exc.code
+def resolve_symbol(
+    code: str,
+    exchange: str,
+    pause,
+    ticker: str = "",
+    match=None,
+) -> tuple[str | None, str]:
+    matcher = match or match_symbol
+    last_error = "没有对应的交易所"
+    tried = 0
+    for yahoo_ex in exchange_candidates(ticker, exchange):
+        source_id = EXCHANGE_MAP.get(yahoo_ex or "")
+        if not source_id:
             continue
-        except urllib.error.URLError as exc:
-            last_error = "搜索失败"
-            continue
-        found = match_symbol(rows, candidate, source_id)
-        if found:
-            return found, ""
+        last_error = "搜索结果里没有 %s:%s" % (source_id, code)
+        for candidate in search_codes(code):
+            if tried:
+                pause()
+            tried += 1
+            try:
+                rows = search_symbol(candidate)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (429, 403):
+                    raise StopRun("代码搜索被限流") from exc
+                last_error = "搜索失败 %s" % exc.code
+                continue
+            except urllib.error.URLError:
+                last_error = "搜索失败"
+                continue
+            found = matcher(rows, candidate, source_id)
+            if found:
+                return found, ""
     return None, last_error
 
 
@@ -1179,7 +1377,12 @@ def run(mode: str, only: set[str], limit: int, force: bool = False) -> None:
             tv_symbol = known.get(ticker) or ""
             try:
                 if not tv_symbol:
-                    tv_symbol, reason = resolve_symbol(code, item.get("exchange") or "", lambda: pause_between(0.8, 1.6))
+                    tv_symbol, reason = resolve_symbol(
+                        code,
+                        item.get("exchange") or "",
+                        lambda: pause_between(0.8, 1.6),
+                        ticker,
+                    )
                     pause_between(0.8, 1.6)
                     if not tv_symbol:
                         unresolved += 1
@@ -1299,7 +1502,7 @@ def run(mode: str, only: set[str], limit: int, force: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="抓取 universe 的 TradingView 财务数据")
+    parser = argparse.ArgumentParser(description="抓取 munger.universe 的 TradingView 财务数据")
     parser.add_argument("--daily", action="store_true", help="只补新增或数值有变化的股票")
     parser.add_argument("--full", action="store_true", help="第一次把名单拉全。18 小时内已经成功的会跳过")
     parser.add_argument("--force", action="store_true", help="不跳过最近已检查的股票，用来补新科目或重新对码")

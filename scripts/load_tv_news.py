@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """把 TradingView 新闻流写入 pangu。
 
-每只股票用公开接口取新闻列表。接口一次最多返回最近 200 条；
-返回里的翻页标记不能再拿来请求更早的新闻。不足 200 条时，就是目前能检索到的全部。
+每只股票用公开接口取新闻列表。英文和简体中文分开请求，再按编号去重。
+接口一次最多返回最近 200 条；返回里的翻页标记不能再拿来请求更早的新闻。
+不足 200 条时，就是目前能检索到的全部。
 每条新闻再取正文。付费墙后面的不请求正文。
 
-一只一只拉。被限流就停。
+一只一只拉。被限流就停。连接被掐、超时这类瞬时错误会连打三次，
+三次还失败：列表失败就跳过这只，正文失败就留下标题不写正文，不把整段任务停掉。
 
 用法：
   .venv/bin/python scripts/load_tv_news.py
@@ -51,31 +53,61 @@ class StopRun(RuntimeError):
     pass
 
 
-def http_json(url: str) -> dict:
-    req = urllib.request.Request(url, headers=HEADERS)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            raise StopRun("新闻接口限流，停下来") from exc
-        detail = exc.read().decode("utf-8", "replace")[:180]
-        raise RuntimeError("HTTP %s %s" % (exc.code, detail)) from exc
+HTTP_ATTEMPTS = 3
+
+
+def http_json(url: str, attempts: int = HTTP_ATTEMPTS) -> dict:
+    last: BaseException | None = None
+    total = max(1, int(attempts))
+    for attempt in range(1, total + 1):
+        req = urllib.request.Request(url, headers=HEADERS)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                raise StopRun("新闻接口限流，停下来") from exc
+            last = exc
+            if exc.code >= 500 and attempt < total:
+                time.sleep(random.uniform(0.8, 1.6) * attempt)
+                continue
+            detail = exc.read().decode("utf-8", "replace")[:180]
+            raise RuntimeError("HTTP %s %s" % (exc.code, detail)) from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            last = exc
+            if attempt >= total:
+                raise
+            time.sleep(random.uniform(0.8, 1.6) * attempt)
+    raise last or RuntimeError("新闻接口没有响应")
+
+
+def news_filter_sets(tv_symbol: str) -> list[list[str]]:
+    """英文流和简体中文流要分开请求。两个语言条件写在一起是且关系，会变成空结果。"""
+    symbol = "symbol:" + tv_symbol
+    return [[symbol], ["lang:zh-Hans", symbol]]
 
 
 def list_news(tv_symbol: str) -> tuple[list[dict], int]:
     """返回新闻列表，以及是否还有更早的新闻拿不到。1 表示到了 200 条上限。"""
-    query = urllib.parse.urlencode(
-        {"client": "web", "filter": "symbol:" + tv_symbol},
-        safe=":",
-    )
-    data = http_json(LIST_URL + "?" + query)
-    items = data.get("items") or []
-    if not isinstance(items, list):
-        items = []
-    cursor = (data.get("pagination") or {}).get("cursor")
-    capped = 1 if cursor and len(items) >= 200 else 0
-    return items, capped
+    seen: dict[str, dict] = {}
+    capped = 0
+    for filters in news_filter_sets(tv_symbol):
+        query = urllib.parse.urlencode(
+            [("client", "web")] + [("filter", item) for item in filters],
+            safe=":",
+        )
+        data = http_json(LIST_URL + "?" + query)
+        items = data.get("items") or []
+        if not isinstance(items, list):
+            items = []
+        cursor = (data.get("pagination") or {}).get("cursor")
+        if cursor and len(items) >= 200:
+            capped = 1
+        for item in items:
+            news_id = item.get("id")
+            if news_id and news_id not in seen:
+                seen[news_id] = item
+    return list(seen.values()), capped
 
 
 def story_of(news_id: str) -> dict:
@@ -206,7 +238,7 @@ def news_row(ticker: str, tv_symbol: str, item: dict, capped: int, when: str) ->
         story = story_of(item["id"])
     except StopRun:
         raise
-    except RuntimeError:
+    except (RuntimeError, urllib.error.URLError, TimeoutError, ConnectionError):
         time.sleep(random.uniform(0.15, 0.3))
         return row
     text = DOC.ast_text(story.get("ast_description")).strip()
@@ -246,25 +278,14 @@ def sync_state(env):
     return {row["ticker"]: row for row in rows}
 
 
-def resolve_symbol(code, exchange):
-    source_id = FIN.EXCHANGE_MAP.get(exchange or "")
-    if not source_id:
-        return None, "没有对应的交易所"
-    last = "搜索结果里没有 %s:%s" % (source_id, code)
-    for index, candidate in enumerate(FIN.search_codes(code)):
-        if index:
-            time.sleep(random.uniform(0.8, 1.6))
-        try:
-            rows = FIN.search_symbol(candidate)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 403):
-                raise StopRun("代码搜索被限流") from exc
-            last = "搜索失败 %s" % exc.code
-            continue
-        found = DOC.match_listing(rows, candidate, source_id)
-        if found:
-            return found, ""
-    return None, last
+def resolve_symbol(code, exchange, ticker=""):
+    return FIN.resolve_symbol(
+        code,
+        exchange,
+        lambda: time.sleep(random.uniform(0.8, 1.6)),
+        ticker,
+        DOC.match_listing,
+    )
 
 
 def new_headlines(headlines, known_ids):
@@ -313,7 +334,7 @@ def run(only, limit, daily):
         try:
             if not tv_symbol:
                 code, _suffix = FIN.ticker_code(ticker)
-                tv_symbol, reason = resolve_symbol(code, item.get("exchange") or "")
+                tv_symbol, reason = resolve_symbol(code, item.get("exchange") or "", ticker)
                 time.sleep(random.uniform(0.8, 1.6))
                 if not tv_symbol:
                     unresolved += 1
@@ -322,7 +343,7 @@ def run(only, limit, daily):
                     time.sleep(random.uniform(1.0, 2.0))
                     continue
             headlines, capped = list_news(tv_symbol)
-        except StopRun:
+        except (StopRun, FIN.StopRun):
             raise
         except (RuntimeError, urllib.error.URLError) as exc:
             write_sync(env, ticker, tv_symbol, 0, 0, "error", str(exc)[:180], FIN.stamp())
@@ -343,8 +364,13 @@ def run(only, limit, daily):
                 if not headline.get("id"):
                     continue
                 rows.append(news_row(ticker, tv_symbol, headline, capped, when))
-        except StopRun:
+        except (StopRun, FIN.StopRun):
             raise
+        except (RuntimeError, urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            write_sync(env, ticker, tv_symbol, 0, capped, "error", str(exc)[:180], when)
+            print("%d/%d %s 失败 %s" % (index, len(items), ticker, str(exc)[:120]), flush=True)
+            time.sleep(random.uniform(2.0, 4.0))
+            continue
         insert_rows(env, "tv_news", rows)
         status = "unchanged" if daily and not rows else "ok"
         write_sync(env, ticker, tv_symbol, len(rows), capped, status, "", when)
@@ -378,7 +404,7 @@ def main():
         return
     try:
         run(only, args.limit, args.daily)
-    except StopRun as exc:
+    except (StopRun, FIN.StopRun) as exc:
         print("停下：%s" % exc, flush=True)
         raise SystemExit(2) from exc
 

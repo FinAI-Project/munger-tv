@@ -6,9 +6,14 @@ PY="${TV_PYTHON:-/usr/bin/python3}"
 mkdir -p data
 LOG=data/tv_daily.log
 {
+  echo "=== $(date -Is) screener ==="
+  "$PY" -u scripts/load_tv_screener.py
+  echo "screener exit $?"
   echo "=== $(date -Is) quotes ==="
   "$PY" -u scripts/load_tv_quotes.py --daily
-  echo "quotes exit $?"
+  code=$?
+  echo "quotes exit $code"
+  echo "$code" > data/tv_quotes.last_exit
   echo "=== $(date -Is) overview ==="
   "$PY" -u scripts/load_tv_overview.py --daily
   echo "overview exit $?"

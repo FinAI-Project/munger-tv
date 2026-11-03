@@ -309,25 +309,14 @@ def sync_state(env: dict[str, str]) -> dict[str, dict]:
     return {row["ticker"]: row for row in rows}
 
 
-def resolve_symbol(code: str, exchange: str) -> tuple[str | None, str]:
-    source_id = FIN.EXCHANGE_MAP.get(exchange or "")
-    if not source_id:
-        return None, "没有对应的交易所"
-    last = "搜索结果里没有 %s:%s" % (source_id, code)
-    for index, candidate in enumerate(FIN.search_codes(code)):
-        if index:
-            time.sleep(random.uniform(0.8, 1.6))
-        try:
-            rows = FIN.search_symbol(candidate)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (429, 403):
-                raise StopRun("代码搜索被限流") from exc
-            last = "搜索失败 %s" % exc.code
-            continue
-        found = match_listing(rows, candidate, source_id)
-        if found:
-            return found, ""
-    return None, last
+def resolve_symbol(code: str, exchange: str, ticker: str = "") -> tuple[str | None, str]:
+    return FIN.resolve_symbol(
+        code,
+        exchange,
+        lambda: time.sleep(random.uniform(0.8, 1.6)),
+        ticker,
+        match_listing,
+    )
 
 
 def write_sync(env, ticker, tv_symbol, doc_count, text_count, status, detail, when):
@@ -418,7 +407,7 @@ def run(only: set[str], limit: int, daily: bool) -> None:
         try:
             if not tv_symbol:
                 code, _suffix = FIN.ticker_code(ticker)
-                tv_symbol, reason = resolve_symbol(code, item.get("exchange") or "")
+                tv_symbol, reason = resolve_symbol(code, item.get("exchange") or "", ticker)
                 time.sleep(random.uniform(0.8, 1.6))
                 if not tv_symbol:
                     unresolved += 1
@@ -427,7 +416,7 @@ def run(only: set[str], limit: int, daily: bool) -> None:
                     time.sleep(random.uniform(1.0, 2.0))
                     continue
             documents = list_documents(tv_symbol)
-        except StopRun:
+        except (StopRun, FIN.StopRun):
             raise
         except (RuntimeError, urllib.error.URLError) as exc:
             write_sync(env, ticker, tv_symbol, 0, 0, "error", str(exc)[:180], FIN.stamp())
@@ -465,7 +454,7 @@ def run(only: set[str], limit: int, daily: bool) -> None:
                 text_rows.append(row)
                 if row["content_status"] == "fetched":
                     text_count += 1
-        except StopRun:
+        except (StopRun, FIN.StopRun):
             raise
         insert_rows(env, "tv_document", doc_rows)
         insert_rows(env, "tv_document_view", text_rows)
@@ -500,7 +489,7 @@ def main() -> None:
         return
     try:
         run(only, args.limit, args.daily)
-    except StopRun as exc:
+    except (StopRun, FIN.StopRun) as exc:
         print("停下：%s" % exc, flush=True)
         raise SystemExit(2) from exc
 

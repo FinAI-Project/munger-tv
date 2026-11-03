@@ -126,19 +126,12 @@ def has_session_cookie(state: dict) -> bool:
 
 async def token_from_page(page) -> str:
     try:
-        data = await page.evaluate(
-            """async () => {
-                const res = await fetch('/accounts/current/', {credentials: 'include'});
-                if (!res.ok) return null;
-                return await res.json();
-            }"""
-        )
+        html = await page.content()
     except Exception:
-        data = None
-    found: dict[str, str] = {}
-    walk_for_token(found, data)
-    if found.get("token"):
-        return found["token"]
+        html = ""
+    token = FIN.extract_auth_token(html)
+    if token:
+        return token
     try:
         stored = await page.evaluate(
             """() => {
@@ -186,7 +179,7 @@ async def run(push: bool) -> None:
 
         async def on_response(response) -> None:
             url = response.url
-            if "signin" not in url and "accounts/current" not in url:
+            if "signin" not in url and "/accounts/" not in url:
                 return
             try:
                 if response.status != 200:
